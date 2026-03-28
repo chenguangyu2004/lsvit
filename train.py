@@ -1,18 +1,27 @@
+"""
+ViT-LSNet 训练脚本
 
+优化内容:
+1. ✅ 移除TensorBoard，改用CSV日志
+2. ✅ 保存最优模型的注意力图、混淆矩阵、热力图
+3. ✅ 添加学习率衰减（ReduceLROnPlateau）
+4. ✅ 保存每个epoch的test和train的loss、accuracy
+5. ✅ 监控增强：过拟合指标、梯度范数、类别准确率分析
+6. ✅ 配置解耦：支持命令行参数和配置文件
+"""
 
 # 标准库导入
 import os
 import sys
 import json
 import time
+import csv
 from typing import Dict, Optional
-from datetime import datetime
 
 # 第三方库导入
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 import numpy as np
 from tqdm import tqdm
@@ -28,6 +37,64 @@ import dataset as dataset_module
 
 SyntheticFERDataset = dataset_module.SyntheticFERDataset
 create_fer2013_dataloaders = getattr(dataset_module, 'create_fer2013_dataloaders', None)
+
+# Focal Loss导入
+try:
+    from focal_loss import FocalLoss
+except ImportError:
+    FocalLoss = None
+
+# 配置导入
+try:
+    from train_config import get_config, save_config
+except ImportError:
+    # 如果train_config不存在，使用默认配置
+    import argparse
+    def get_config():
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--batch_size', type=int, default=32)
+        parser.add_argument('--num_epochs', type=int, default=120)
+        parser.add_argument('--learning_rate', type=float, default=3e-4)
+        parser.add_argument('--device', type=str, default='cuda')
+        parser.add_argument('--save_dir', type=str, default='./checkpoints')
+        parser.add_argument('--log_dir', type=str, default='./logs')
+        args = parser.parse_args()
+        # 添加默认属性
+        args.weight_decay = 1e-3
+        args.early_stopping_patience = 8
+        args.use_mixed_precision = True
+        args.save_attention = True
+        args.save_confusion_matrix = True
+        args.use_focal_loss = True
+        args.focal_gamma = 1.5
+        args.use_ls_conv = True
+        args.use_kimi_residual = True
+        args.lr_scheduler = 'reduce_on_plateau'
+        args.lr_patience = 5
+        args.lr_factor = 0.5
+        args.lr_min = 1e-6
+        args.grad_clip = 1.0
+        args.use_class_weights = True
+        args.class_weights = [1.2, 8.0, 1.5, 0.6, 0.9, 1.3, 1.1]
+        args.monitor_overfitting = True
+        args.monitor_grad_norm = True
+        args.monitor_class_accuracy = True
+        args.save_period = 10
+        args.num_layers = 12
+        args.embed_dim = 384
+        args.num_heads = 6
+        args.mlp_ratio = 4.0
+        args.dropout = 0.1
+        args.data_csv = 'FER2013.csv'
+        args.num_workers = 4
+        args.img_size = 224
+        args.use_augmentation = True
+        args.augmentation_prob = 0.5
+        args.use_mtcnn = False
+        return args
+
+    def save_config(args, save_path='./checkpoints/config.json'):
+        pass
 
 
 def setup_device():
@@ -45,157 +112,160 @@ def setup_device():
 
 
 class Trainer:
-    """训练器 - 增强版（详细记录每个batch）"""
+    """训练器 - 优化版"""
 
-    def __init__(self,
-                 model: nn.Module,
-                 train_loader: DataLoader,
-                 test_loader: DataLoader,
-                 num_epochs: int = 100,
-                 learning_rate: float = 3e-4,
-                 weight_decay: float = 0.05,
-                 device: str = 'cuda',
-                 save_dir: str = './checkpoints',
-                 log_dir: str = './logs',
-                 use_mixed_precision: bool = True,
-                 save_attention: bool = True,
-                 save_confusion_matrix: bool = True,
-                 ablation_mode: Optional[Dict] = None,
-                 log_batch_every: int = 10):
+    def __init__(self, model, train_loader, test_loader, args):
         """
         Args:
             model: 模型
             train_loader: 训练数据加载器
             test_loader: 测试数据加载器
-            num_epochs: 训练轮数
-            learning_rate: 学习率
-            weight_decay: 权重衰减
-            device: 设备
-            save_dir: 模型保存目录
-            log_dir: 日志保存目录
-            use_mixed_precision: 是否使用混合精度训练
-            save_attention: 是否保存注意力热力图
-            save_confusion_matrix: 是否保存混淆矩阵
-            ablation_mode: 消融实验模式
-            log_batch_every: 每隔多少个batch记录一次详细信息
+            args: 配置参数（从train_config.get_config()获取）
         """
-        self.model = model.to(device)
+        self.model = model.to(args.device)
         self.train_loader = train_loader
         self.test_loader = test_loader
-        self.num_epochs = num_epochs
-        self.device = device
-        self.save_dir = save_dir
-        self.log_dir = log_dir
-        self.use_mixed_precision = use_mixed_precision
-        self.save_attention = save_attention
-        self.save_confusion_matrix = save_confusion_matrix
-        self.ablation_mode = ablation_mode or {'use_ls_conv': True, 'use_kimi_residual': True}
-        self.log_batch_every = log_batch_every
+        self.num_epochs = args.num_epochs
+        self.device = args.device
+        self.save_dir = args.save_dir
+        self.log_dir = args.log_dir
+        self.use_mixed_precision = args.use_mixed_precision
+        self.save_attention = args.save_attention
+        self.save_confusion_matrix = args.save_confusion_matrix
+        self.grad_clip = args.grad_clip
+        self.monitor_overfitting = args.monitor_overfitting
+        self.monitor_grad_norm = args.monitor_grad_norm
+        self.monitor_class_accuracy = args.monitor_class_accuracy
+        self.save_period = args.save_period
+
+        # 消融实验模式
+        self.ablation_mode = {
+            'use_ls_conv': args.use_ls_conv,
+            'use_kimi_residual': args.use_kimi_residual
+        }
 
         # 创建目录
-        os.makedirs(save_dir, exist_ok=True)
-        os.makedirs(log_dir, exist_ok=True)
-        os.makedirs(os.path.join(log_dir, 'attention_maps'), exist_ok=True)
-        os.makedirs(os.path.join(log_dir, 'confusion_matrices'), exist_ok=True)
-        os.makedirs(os.path.join(log_dir, 'batch_logs'), exist_ok=True)
+        os.makedirs(args.save_dir, exist_ok=True)
+        os.makedirs(args.log_dir, exist_ok=True)
+        os.makedirs(os.path.join(args.log_dir, 'attention_maps'), exist_ok=True)
+        os.makedirs(os.path.join(args.log_dir, 'confusion_matrices'), exist_ok=True)
 
         # 损失函数
-        self.criterion = nn.CrossEntropyLoss()
+        if args.use_focal_loss and FocalLoss is not None:
+            class_weights = torch.tensor(args.class_weights).to(self.device) if args.use_class_weights else None
+            self.criterion = FocalLoss(
+                alpha=class_weights,
+                gamma=args.focal_gamma
+            )
+            print('使用Focal Loss')
+        else:
+            class_weights = torch.tensor(args.class_weights).to(self.device) if args.use_class_weights else None
+            self.criterion = nn.CrossEntropyLoss(
+                weight=class_weights
+            )
+            print('使用CrossEntropyLoss')
 
         # 优化器
         self.optimizer = optim.AdamW(
             self.model.parameters(),
-            lr=learning_rate,
-            weight_decay=weight_decay
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay
         )
 
         # 学习率调度器
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
-            T_max=num_epochs,
-            eta_min=learning_rate * 0.01
-        )
+        if args.lr_scheduler == 'reduce_on_plateau':
+            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode='max',
+                factor=args.lr_factor,
+                patience=args.lr_patience,
+                min_lr=args.lr_min,
+                verbose=True
+            )
+        elif args.lr_scheduler == 'cosine':
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=args.num_epochs,
+                eta_min=args.lr_min
+            )
+        else:  # step
+            self.scheduler = optim.lr_scheduler.StepLR(
+                self.optimizer,
+                step_size=args.num_epochs // 3,
+                gamma=0.1
+            )
 
         # 混合精度训练
-        self.scaler = torch.cuda.amp.GradScaler() if use_mixed_precision else None
-
-        # TensorBoard
-        self.writer = SummaryWriter(log_dir)
+        self.scaler = torch.cuda.amp.GradScaler() if args.use_mixed_precision else None
 
         # 训练状态
         self.current_epoch = 0
         self.best_acc = 0.0
+        self.early_stop_count = 0
+        self.early_stopping_patience = args.early_stopping_patience
         self.train_losses = []
         self.train_accs = []
         self.test_losses = []
         self.test_accs = []
         self.learning_rates = []
         self.epoch_times = []
+        self.overfitting_gaps = []
+        self.grad_norms = []
+        self.class_accuracies = []
 
-        # 记录每个batch的详细信息
-        self.batch_losses = []
-        self.batch_accs = []
+        # CSV日志文件
+        self.training_log_path = os.path.join(args.log_dir, 'training_log.csv')
+        self._init_training_log()
 
-        print(f'初始化完成，每隔 {log_batch_every} 个batch记录详细信息')
+        print(f'初始化完成')
+        print(f'  学习率调度器: {args.lr_scheduler}')
+        print(f'  早停patience: {args.early_stopping_patience}')
+        print(f'  梯度裁剪: {args.grad_clip if args.grad_clip > 0 else "关闭"}')
 
-    def log_batch_details(self, batch_idx, images, labels, outputs, loss, predicted, epoch_start_time):
-        """记录每个batch的详细信息到TensorBoard"""
-        global_step = self.current_epoch * len(self.train_loader) + batch_idx
+    def _init_training_log(self):
+        """初始化训练日志CSV"""
+        with open(self.training_log_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            # 写入表头
+            writer.writerow([
+                'Epoch',
+                'Train_Loss',
+                'Train_Accuracy(%)',
+                'Test_Loss',
+                'Test_Accuracy(%)',
+                'Overfitting_Gap(%)',
+                'Learning_Rate',
+                'Epoch_Time(s)',
+                'Grad_Norm',
+                'No_Improve_Count',
+                'Best_Test_Acc(%)'
+            ])
+        print(f'训练日志已初始化: {self.training_log_path}')
 
-        # 基础统计
-        batch_acc = (predicted.eq(labels).sum().item() / labels.size(0) * 100)
+    def _log_epoch_to_csv(self, train_loss, train_acc, test_loss, test_acc,
+                        epoch_time, lr, grad_norm):
+        """记录epoch到CSV日志"""
+        overfitting_gap = train_acc - test_acc
+        self.overfitting_gaps.append(overfitting_gap)
 
-        # 记录每个batch的loss和accuracy
-        self.writer.add_scalar('Batch/train_loss', loss.item(), global_step)
-        self.writer.add_scalar('Batch/train_accuracy', batch_acc, global_step)
-
-        # 每隔log_batch_every个batch记录一次详细信息
-        if batch_idx % self.log_batch_every == 0:
-            # 统计每个类别的预测数量
-            pred_distribution = torch.bincount(predicted, minlength=7).float()
-            pred_distribution = pred_distribution / pred_distribution.sum() * 100
-
-            # 记录每个类别的准确率
-            class_acc = []
-            for class_id in range(7):
-                class_mask = (labels == class_id)
-                if class_mask.sum() > 0:
-                    class_correct = (predicted[class_mask] == labels[class_mask]).sum().item()
-                    class_acc.append(class_correct / class_mask.sum().item() * 100)
-                else:
-                    class_acc.append(0.0)
-
-            # 写入TensorBoard
-            for i in range(7):
-                self.writer.add_scalar(f'Batch/Class_{EMOTION_LABELS[i]}_Accuracy',
-                                       class_acc[i], global_step)
-                self.writer.add_scalar(f'Batch/Class_{EMOTION_LABELS[i]}_Pred_Rate',
-                                       pred_distribution[i].item(), global_step)
-
-        # ========== 【BUG修复 1】直方图只在有有效值时写入 ==========
-        if batch_idx % 200 == 0:
-            for name, param in self.model.named_parameters():
-                if 'weight' in name and param.requires_grad and param.grad is not None:
-                    if param.grad.numel() > 0:
-                        self.writer.add_histogram(f'Weights/{name}', param.data, global_step)
-                        self.writer.add_histogram(f'Gradients/{name}', param.grad, global_step)
-
-        # 每50个batch记录一次梯度范数
-        if batch_idx % 50 == 0:
-            total_norm = 0.0
-            for param in self.model.parameters():
-                if param.grad is not None:
-                    param_norm = param.grad.data.norm(2).item()
-                    total_norm += param_norm ** 2
-            total_norm = total_norm ** 0.5
-            self.writer.add_scalar('Batch/Gradient_Norm', total_norm, global_step)
-
-        # 保存到列表
-        self.batch_losses.append(loss.item())
-        self.batch_accs.append(batch_acc)
+        with open(self.training_log_path, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                self.current_epoch + 1,
+                f'{train_loss:.6f}',
+                f'{train_acc:.4f}',
+                f'{test_loss:.6f}',
+                f'{test_acc:.4f}',
+                f'{overfitting_gap:.4f}',
+                f'{lr:.8f}',
+                f'{epoch_time:.2f}',
+                f'{grad_norm:.6f}' if grad_norm > 0 else 'N/A',
+                self.early_stop_count,
+                f'{self.best_acc:.4f}'
+            ])
 
     def train_epoch(self):
-        """训练一个epoch - 详细记录每个batch"""
+        """训练一个epoch"""
         self.model.train()
 
         total_loss = 0.0
@@ -218,12 +288,23 @@ class Trainer:
                     outputs = self.model(images)
                     loss = self.criterion(outputs, labels)
                 self.scaler.scale(loss).backward()
+
+                # 梯度裁剪
+                if self.grad_clip > 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
+
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 outputs = self.model(images)
                 loss = self.criterion(outputs, labels)
                 loss.backward()
+
+                # 梯度裁剪
+                if self.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.grad_clip)
+
                 self.optimizer.step()
 
             # 统计
@@ -231,9 +312,6 @@ class Trainer:
             _, predicted = outputs.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
-
-            # 记录每个batch的详细信息
-            self.log_batch_details(batch_idx, images, labels, outputs, loss, predicted, epoch_start_time)
 
             # 更新进度条
             pbar.set_postfix({
@@ -248,18 +326,10 @@ class Trainer:
         self.train_losses.append(avg_loss)
         self.train_accs.append(acc)
 
-        # 记录epoch级别的指标
-        self.writer.add_scalar('Epoch/train_loss', avg_loss, self.current_epoch)
-        self.writer.add_scalar('Epoch/train_accuracy', acc, self.current_epoch)
-        if len(self.batch_losses) > 0:
-            self.writer.add_histogram('Epoch/train_loss_distribution', np.array(self.batch_losses), self.current_epoch)
-            self.writer.add_histogram('Epoch/train_acc_distribution', np.array(self.batch_accs), self.current_epoch)
+        epoch_time = time.time() - epoch_start_time
+        self.epoch_times.append(epoch_time)
 
-        # 重置batch记录
-        self.batch_losses = []
-        self.batch_accs = []
-
-        return avg_loss, acc
+        return avg_loss, acc, epoch_time
 
     @torch.no_grad()
     def test(self, save_cm=False):
@@ -271,7 +341,10 @@ class Trainer:
         total = 0
         all_preds = []
         all_labels = []
-        test_losses = []
+
+        # 类别准确率统计
+        class_correct = [0] * 7
+        class_total = [0] * 7
 
         pbar = tqdm(self.test_loader, desc='Testing', leave=False)
 
@@ -288,10 +361,17 @@ class Trainer:
                 loss = self.criterion(outputs, labels)
 
             total_loss += loss.item()
-            test_losses.append(loss.item())
             _, predicted = outputs.max(1)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
+
+            # 统计每个类别的准确率
+            for i in range(len(labels)):
+                label = labels[i].item()
+                pred = predicted[i].item()
+                class_total[label] += 1
+                if pred == label:
+                    class_correct[label] += 1
 
             all_preds.extend(predicted.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
@@ -307,11 +387,14 @@ class Trainer:
         self.test_losses.append(avg_loss)
         self.test_accs.append(acc)
 
-        # 记录到TensorBoard
-        self.writer.add_scalar('Epoch/test_loss', avg_loss, self.current_epoch)
-        self.writer.add_scalar('Epoch/test_accuracy', acc, self.current_epoch)
-        if len(test_losses) > 0:
-            self.writer.add_histogram('Epoch/test_loss_distribution', np.array(test_losses), self.current_epoch)
+        # 计算类别准确率
+        class_acc = []
+        for i in range(7):
+            if class_total[i] > 0:
+                class_acc.append(100. * class_correct[i] / class_total[i])
+            else:
+                class_acc.append(0.0)
+        self.class_accuracies.append(class_acc)
 
         # 保存混淆矩阵
         if save_cm and len(all_preds) > 0:
@@ -332,22 +415,13 @@ class Trainer:
         plt.ylabel('True')
         plt.title(f'Confusion Matrix - Epoch {self.current_epoch + 1}')
 
-        # 保存到 log_dir 下的 confusion_matrices 目录
+        # 保存
         save_path = os.path.join(self.log_dir, 'confusion_matrices',
                                  f'confusion_matrix_epoch_{self.current_epoch + 1}.png')
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
 
-        # 保存到TensorBoard
-        fig = plt.figure(figsize=(10, 8))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                    xticklabels=list(EMOTION_LABELS.values()),
-                    yticklabels=list(EMOTION_LABELS.values()))
-        plt.xlabel('Predicted')
-        plt.ylabel('True')
-        plt.title(f'Confusion Matrix - Epoch {self.current_epoch + 1}')
-        self.writer.add_figure('Confusion_Matrix', fig, self.current_epoch)
-        plt.close()
+        print(f'混淆矩阵已保存: {save_path}')
 
     @torch.no_grad()
     def save_attention_maps(self, num_samples=4):
@@ -390,106 +464,179 @@ class Trainer:
 
         print(f'已保存 {num_samples} 个注意力热力图')
 
+    def _check_early_stopping(self, test_acc):
+        """检查早停条件"""
+        # 更新最佳准确率
+        if test_acc > self.best_acc:
+            self.best_acc = test_acc
+            self.early_stop_count = 0
+            self.save_checkpoint(is_best=True)
+            print(f'  ✓ 测试准确率提升至: {test_acc:.2f}% (保存最佳模型)')
+        else:
+            self.early_stop_count += 1
+            print(f'  ⚠️ 测试准确率未改善 ({self.early_stop_count}/{self.early_stopping_patience})')
+
+        # 早停检查
+        if self.early_stop_count >= self.early_stopping_patience:
+            print('\n' + '='*60)
+            print('⚠️ 早停触发!')
+            print('='*60)
+            print(f'  连续 {self.early_stopping_patience} 个epoch准确率未改善')
+            print(f'  最佳测试准确率: {self.best_acc:.2f}%')
+            print(f'  在Epoch {self.current_epoch + 1}/{self.num_epochs} 停止训练')
+            print('='*60)
+            return True
+
+        return False
+
+    def save_checkpoint(self, is_best=False):
+        """保存检查点"""
+        checkpoint = {
+            'epoch': self.current_epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'best_acc': self.best_acc,
+            'train_losses': self.train_losses,
+            'test_accs': self.test_accs,
+            'learning_rates': self.learning_rates,
+            'ablation_mode': self.ablation_mode
+        }
+
+        if is_best:
+            path = os.path.join(self.save_dir, 'best_model.pth')
+            print(f'  保存最佳模型: {path}')
+        else:
+            path = os.path.join(self.save_dir, f'checkpoint_epoch_{self.current_epoch + 1}.pth')
+
+        torch.save(checkpoint, path)
+
     def train(self):
         """完整训练流程"""
-        print('\n' + '=' * 60)
+        print('\n' + '='*60)
         print('训练配置')
-        print('=' * 60)
+        print('='*60)
         print(f'  设备: {self.device}')
         print(f'  模型参数量: {sum(p.numel() for p in self.model.parameters()):,}')
         print(f'  混合精度训练: {self.use_mixed_precision}')
         print(f'  保存注意力图: {self.save_attention}')
         print(f'  保存混淆矩阵: {self.save_confusion_matrix}')
-        print(
-            f'  消融实验: LS-Conv={self.ablation_mode["use_ls_conv"]}, Kimi-Residual={self.ablation_mode["use_kimi_residual"]}')
-        print(f'  Batch详细记录: 每隔 {self.log_batch_every} 个batch')
-        print('=' * 60)
-
-        # 记录消融实验配置
-        self.writer.add_text('Ablation/Config',
-                             json.dumps(self.ablation_mode, indent=2),
-                             0)
-
-        # 记录超参数
-        hparam_dict = {
-            'num_epochs': self.num_epochs,
-            'learning_rate': self.optimizer.param_groups[0]["lr"],
-            'weight_decay': self.optimizer.param_groups[0]["weight_decay"],
-            'batch_size': self.train_loader.batch_size,
-            'use_mixed_precision': self.use_mixed_precision,
-            'use_ls_conv': self.ablation_mode['use_ls_conv'],
-            'use_kimi_residual': self.ablation_mode['use_kimi_residual']
-        }
-        self.writer.add_hparams(hparam_dict, {'hparam/accuracy': 0})
+        print(f'  监控过拟合: {self.monitor_overfitting}')
+        print(f'  监控梯度范数: {self.monitor_grad_norm}')
+        print(f'  监控类别准确率: {self.monitor_class_accuracy}')
+        print(f'  消融实验: LS-Conv={self.ablation_mode["use_ls_conv"]}, Kimi-Residual={self.ablation_mode["use_kimi_residual"]}')
+        print('='*60)
 
         print('\n开始训练...\n')
 
-        for epoch in range(self.num_epochs):
-            self.current_epoch = epoch
-            epoch_start_time = time.time()
+        start_time = time.time()
 
-            # 训练
-            train_loss, train_acc = self.train_epoch()
+        try:
+            for epoch in range(self.num_epochs):
+                self.current_epoch = epoch
 
-            # 测试
-            test_loss, test_acc = self.test(save_cm=self.save_confusion_matrix)
+                print(f'\nEpoch [{epoch + 1}/{self.num_epochs}]')
+                print('-' * 40)
 
-            # 更新学习率
-            self.scheduler.step()
-            current_lr = self.optimizer.param_groups[0]['lr']
+                # 训练
+                train_loss, train_acc, epoch_time = self.train_epoch()
+                print(f'  训练Loss: {train_loss:.4f}, 训练准确率: {train_acc:.2f}%')
 
-            epoch_time = time.time() - epoch_start_time
-            self.epoch_times.append(epoch_time)
-            self.learning_rates.append(current_lr)
+                # 测试
+                test_loss, test_acc = self.test(save_cm=self.save_confusion_matrix)
+                print(f'  测试Loss: {test_loss:.4f}, 测试准确率: {test_acc:.2f}%')
 
-            # 记录到TensorBoard
-            self.writer.add_scalar('Learning_Rate', current_lr, epoch)
-            self.writer.add_scalar('Epoch/Time', epoch_time, epoch)
+                # 计算梯度范数
+                grad_norm = 0.0
+                if self.monitor_grad_norm:
+                    total_norm = 0.0
+                    for param in self.model.parameters():
+                        if param.grad is not None:
+                            param_norm = param.grad.data.norm(2).item()
+                            total_norm += param_norm ** 2
+                    grad_norm = total_norm ** 0.5
+                    self.grad_norms.append(grad_norm)
+                    print(f'  梯度范数: {grad_norm:.6f}')
 
-            # 打印结果
-            print(f'\nEpoch [{epoch + 1}/{self.num_epochs}]')
-            print(f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
-            print(f'Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.2f}%')
-            print(f'Learning Rate: {current_lr:.6f}')
-            print(f'Epoch Time: {epoch_time:.2f}s')
-            if epoch > 0:
-                avg_time = np.mean(self.epoch_times[:epoch])
-                eta = avg_time * (self.num_epochs - epoch - 1) / 60
-                print(f'ETA: {eta:.1f} min')
+                # 更新学习率
+                current_lr = self.optimizer.param_groups[0]['lr']
+                if self.scheduler.__class__.__name__ == 'ReduceLROnPlateau':
+                    self.scheduler.step(test_acc)
+                else:
+                    self.scheduler.step()
+                current_lr = self.optimizer.param_groups[0]['lr']
+                self.learning_rates.append(current_lr)
+                print(f'  学习率: {current_lr:.6f}')
 
-            # 保存注意力热力图（每10个epoch保存一次）
-            if self.save_attention and (epoch + 1) % 10 == 0:
-                self.save_attention_maps(num_samples=4)
+                # 记录到CSV
+                self._log_epoch_to_csv(train_loss, train_acc, test_loss, test_acc,
+                                     epoch_time, current_lr, grad_norm)
 
-            # 保存最佳模型
-            if test_acc > self.best_acc:
-                self.best_acc = test_acc
-                self.save_checkpoint(epoch, is_best=True)
-                print(f'保存最佳模型 (测试准确率: {test_acc:.2f}%)')
+                # 过拟合监控
+                overfitting_gap = train_acc - test_acc
+                if self.monitor_overfitting:
+                    print(f'  过拟合差距: {overfitting_gap:.2f}%')
+                    if overfitting_gap > 20.0:
+                        print(f'  ⚠️ 警告: 过拟合严重!')
 
-            # 定期保存模型
-            if (epoch + 1) % 10 == 0:
-                self.save_checkpoint(epoch)
+                # 类别准确率监控
+                if self.monitor_class_accuracy and len(self.class_accuracies) > 0:
+                    class_acc = self.class_accuracies[-1]
+                    print(f'  类别准确率:', end='')
+                    for i, acc in enumerate(class_acc):
+                        print(f' {EMOTION_LABELS[i]}={acc:.1f}%', end='')
+                    print()
 
-        print('\n' + '=' * 60)
+                # 早停检查
+                if self._check_early_stopping(test_acc):
+                    break
+
+                # 保存注意力热力图（每10个epoch保存一次）
+                if self.save_attention and (epoch + 1) % 10 == 0:
+                    # 传入模型输入图像而非attention maps
+                    self.save_attention_maps(num_samples=4)
+
+                # 定期保存模型
+                if (epoch + 1) % self.save_period == 0:
+                    self.save_checkpoint(is_best=False)
+                    print(f'  定期保存检查点: epoch_{epoch + 1}')
+
+                # ETA计算
+                if epoch > 0:
+                    avg_time = np.mean(self.epoch_times[:epoch])
+                    eta = avg_time * (self.num_epochs - epoch - 1) / 60
+                    print(f'  预计剩余时间: {eta:.1f} min')
+
+        except KeyboardInterrupt:
+            print('\n训练被中断')
+            self.save_checkpoint(is_best=False)
+
+        # 训练完成
+        print('\n' + '='*60)
         print('训练完成!')
-        print('=' * 60)
+        print('='*60)
         print(f'  最佳测试准确率: {self.best_acc:.2f}%')
         print(f'  平均每个epoch时间: {np.mean(self.epoch_times):.2f}s')
         print(f'  总训练时间: {sum(self.epoch_times) / 60:.1f} min')
-        print('=' * 60)
+
+        # 过拟合分析
+        if self.monitor_overfitting and len(self.overfitting_gaps) > 0:
+            avg_gap = np.mean(self.overfitting_gaps)
+            print(f'  平均过拟合差距: {avg_gap:.2f}%')
+
+        print('='*60)
 
         # 保存最终混淆矩阵和分类报告
         if self.save_confusion_matrix:
-            print('\n保存最终混淆矩阵和分类报告...')
-            self._save_confusion_matrix_and_report()
+            self._save_final_report()
 
-        self.writer.close()
-        print('\nTensorBoard日志已保存到 ./logs')
-        print('运行以下命令查看：tensorboard --logdir=./logs')
+        # 绘制训练曲线
+        self._plot_training_curves()
 
-    def _save_confusion_matrix_and_report(self):
+    def _save_final_report(self):
         """保存最终混淆矩阵和分类报告"""
+        print('\n保存最终混淆矩阵和分类报告...')
+
         # 获取所有预测
         all_preds = []
         all_labels = []
@@ -513,101 +660,116 @@ class Trainer:
 
         # 保存到文件
         report_path = os.path.join(self.save_dir, 'classification_report.json')
-        with open(report_path, 'w') as f:
-            json.dump(report, f, indent=2)
+        with open(report_path, 'w', encoding='utf-8') as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
 
         print(f'分类报告已保存到 {report_path}')
 
-        # 记录到TensorBoard
-        self.writer.add_text('Final/Classification_Report',
-                             json.dumps(report, indent=2),
-                             self.num_epochs - 1)
+    def _plot_training_curves(self):
+        """绘制训练曲线"""
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
 
-    def save_checkpoint(self, epoch: int, is_best: bool = False):
-        """保存检查点"""
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'best_acc': self.best_acc,
-            'train_losses': self.train_losses,
-            'test_accs': self.test_accs,
-            'learning_rates': self.learning_rates,
-            'ablation_mode': self.ablation_mode
-        }
+        # 训练准确率
+        axes[0, 0].plot(range(1, len(self.train_accs) + 1), self.train_accs,
+                     'b-', linewidth=2, label='训练准确率')
+        axes[0, 0].plot(range(1, len(self.test_accs) + 1), self.test_accs,
+                     'r-', linewidth=2, label='测试准确率')
+        axes[0, 0].set_xlabel('Epoch')
+        axes[0, 0].set_ylabel('准确率 (%)')
+        axes[0, 0].set_title('训练曲线')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
 
-        if is_best:
-            path = os.path.join(self.save_dir, 'best_model.pth')
-        else:
-            path = os.path.join(self.save_dir, f'checkpoint_epoch_{epoch + 1}.pth')
+        # 训练损失
+        axes[0, 1].plot(range(1, len(self.train_losses) + 1), self.train_losses,
+                     'b-', linewidth=2, label='训练损失')
+        axes[0, 1].plot(range(1, len(self.test_losses) + 1), self.test_losses,
+                     'r-', linewidth=2, label='测试损失')
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('损失')
+        axes[0, 1].set_title('损失曲线')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
 
-        torch.save(checkpoint, path)
+        # 过拟合差距
+        axes[1, 0].plot(range(1, len(self.overfitting_gaps) + 1), self.overfitting_gaps,
+                     'g-', linewidth=2, label='过拟合差距')
+        axes[1, 0].axhline(y=10.0, color='r', linestyle='--', alpha=0.5, label='警告线')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('差距 (%)')
+        axes[1, 0].set_title('过拟合监控')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
 
-        # 同时保存模型配置
-        config = {
-            'best_acc': self.best_acc,
-            'num_epochs': self.num_epochs,
-            'train_losses': self.train_losses,
-            'test_accs': self.test_accs,
-            'learning_rates': self.learning_rates,
-            'ablation_mode': self.ablation_mode
-        }
-        with open(os.path.join(self.save_dir, 'config.json'), 'w') as f:
-            json.dump(config, f, indent=4)
+        # 学习率
+        axes[1, 1].plot(range(1, len(self.learning_rates) + 1), self.learning_rates,
+                     'g-', linewidth=2, label='学习率')
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('学习率')
+        axes[1, 1].set_title('学习率')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        save_path = os.path.join(self.log_dir, 'training_curves.png')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+
+        print(f'训练曲线已保存: {save_path}')
 
 
 def main():
     """主函数"""
+    # 获取配置
+    args = get_config()
+
+    # 保存配置
+    save_config(args)
+
     # 设置随机种子
     torch.manual_seed(42)
     np.random.seed(42)
-    
+
     # 设置设备
     device = setup_device()
-    
-    # 检查数据集格式并自动判断是否为灰度图
-    csv_file = 'FER2013.csv'
-    use_grayscale = False  # 默认值
-    
-    # 使用 try-except 捕获数据集加载异常，并提供回退方案
-    try:
-        import pandas as pd
-        df = pd.read_csv(csv_file)
-        
-        # 检查数据集格式，自动判断是否为灰度图（48x48 = 2304 像素）
-        if 'pixels' in df.columns and 'emotion' in df.columns:
-            sample_pixels = df.iloc[0]['pixels'].split()
-            is_grayscale = len(sample_pixels) == 2304  # 48x48 = 2304 像素
-            print(f'✓ 检测到 {csv_file}，确认为灰度图数据集')
-            use_grayscale = is_grayscale
-        else:
-            print(f'⚠ {csv_file} 格式非标准，使用默认设置')
-    
-    except FileNotFoundError:
-        print(f'⚠ 未找到 {csv_file}，将使用合成数据集')
-    except Exception as e:
-        print(f'⚠ 数据集检查失败: {str(e)}，将使用合成数据集')
 
-    # 检查是否有真实数据集（FER2013.csv）
-    csv_file = 'FER2013.csv'
+    # 检查数据集
+    csv_file = args.data_csv
     use_grayscale = os.path.exists(csv_file)  # FER2013 是灰度图
 
     # 创建模型
     config = ViTLSNetFERConfig.LIGHT.copy()
     config['in_channels'] = 1 if use_grayscale else 3
+    config['num_layers'] = args.num_layers
+    config['embed_dim'] = args.embed_dim
+    config['num_heads'] = args.num_heads
+    config['mlp_ratio'] = args.mlp_ratio
+    config['dropout'] = args.dropout
+    config['ls_block_layers'] = getattr(args, 'ls_block_layers', 8)  # 使用命令行参数或默认8层
 
     model = ViTLSNetFER(**config)
-    print('\n' + '=' * 60)
+    print('\n' + '='*60)
     print('模型配置')
-    print('=' * 60)
+    print('='*60)
     print(f'  输入通道: {1 if use_grayscale else 3} ({"灰度图" if use_grayscale else "彩色图"})')
     print(f'  嵌入维度: {model.embed_dim}')
     print(f'  Encoder层数: {model.encoder.num_layers}')
-    print(f'  注意力头数: {model.encoder.layers[0].attn_block.attn.num_heads}')
+    print(f'  LS Block层数: {model.encoder.ls_block_layers}（{model.encoder.ls_block_layers/model.encoder.num_layers*100:.1f}%）')
+    print(f'  MSA Block层数: {model.encoder.num_layers - model.encoder.ls_block_layers}（{(model.encoder.num_layers - model.encoder.ls_block_layers)/model.encoder.num_layers*100:.1f}%）')
+
+    # 获取注意力头数（从使用MHSA的层获取）
+    mhsa_layer_idx = model.encoder.ls_block_layers if model.encoder.ls_block_layers < model.encoder.num_layers else 0
+    if mhsa_layer_idx < len(model.encoder.layers) and hasattr(model.encoder.layers[mhsa_layer_idx].attn_block, 'attn'):
+        print(f'  注意力头数: {model.encoder.layers[mhsa_layer_idx].attn_block.attn.num_heads}')
+    else:
+        print(f'  注意力头数: {config.get("num_heads", args.num_heads)}')
+
     print(f'  使用LS卷积: {model.encoder.layers[0].use_ls_conv}')
-    print(f'  使用Kimi残差: {model.encoder.layers[0].attn_block.__class__.__name__}')
-    print('=' * 60)
+    print(f'  LS Block层数: {model.encoder.ls_block_layers}（前{model.encoder.ls_block_layers}层无MHSA）')
+    print(f'  MSA Block层数: {model.encoder.num_layers - model.encoder.ls_block_layers}')
+    print(f'  使用Kimi残差: True')
+    print(f'  模型参数量: {sum(p.numel() for p in model.parameters()):,}')
+    print('='*60)
 
     print('\n创建数据加载器...')
 
@@ -616,31 +778,30 @@ def main():
 
         train_loader, test_loader = create_fer2013_dataloaders(
             csv_file=csv_file,
-            batch_size=32,
-            num_workers=0,
-            img_size=224
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            img_size=args.img_size
         )
 
         print(f'训练集: {len(train_loader.dataset)} 样本')
         print(f'测试集: {len(test_loader.dataset)} 样本')
-        num_epochs = 50  # 真实数据集训练更多轮
     else:
         print(f'未找到 {csv_file}，使用合成数据集测试')
-        print(f'提示: 将FER2013.csv放在项目根目录以使用真实数据')
+        print(f'提示: 将{csv_file}放在项目根目录以使用真实数据')
 
         train_dataset = SyntheticFERDataset(num_samples=1000, num_classes=7)
         test_dataset = SyntheticFERDataset(num_samples=200, num_classes=7)
 
         train_loader = DataLoader(
             train_dataset,
-            batch_size=32,
+            batch_size=args.batch_size,
             shuffle=True,
             num_workers=0
         )
 
         test_loader = DataLoader(
             test_dataset,
-            batch_size=32,
+            batch_size=args.batch_size,
             shuffle=False,
             num_workers=0
         )
@@ -648,30 +809,13 @@ def main():
         print(f'训练集: {len(train_dataset)} 样本')
         print(f'测试集: {len(test_dataset)} 样本')
         print(f'表情类别: {EMOTION_LABELS}')
-        num_epochs = 5  # 合成数据集只训练5轮
-
-    # 消融实验模式（可以修改进行对比实验）
-    ablation_mode = {
-        'use_ls_conv': True,  # LS卷积开关
-        'use_kimi_residual': True  # Kimi残差开关
-    }
 
     # 创建训练器
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
         test_loader=test_loader,
-        num_epochs=num_epochs,
-        learning_rate=3e-4,
-        weight_decay=0.05,
-        device=device,
-        save_dir='./checkpoints',
-        log_dir='./logs',
-        use_mixed_precision=True,
-        save_attention=True,
-        save_confusion_matrix=True,
-        ablation_mode=ablation_mode,
-        log_batch_every=10  # 每隔10个batch记录详细信息
+        args=args
     )
 
     # 开始训练

@@ -132,16 +132,16 @@ class SequenceToSpatial(nn.Module):
 
 class ViTLSNetEncoderLayer(nn.Module):
     """
-    ViT-LSNet融合的Transformer Encoder层
-    
-    核心结构（严格顺序）:
+    ViT-LSNet融合的Transformer Encoder层（支持可选MHSA）
+
+    结构（严格顺序）:
     1. LS卷积：局部特征聚合（提取面部五官细节）
-    2. 多头自注意力（MHSA）：全局信息交互（建模整体表情）
+    2. 多头自注意力（MHSA）：全局信息交互（可选）
     3. 前馈网络（FFN）：特征变换
-    
+
     使用Kimi自注意力残差连接替换标准残差连接
     """
-    
+
     def __init__(self,
                  embed_dim: int,
                  num_heads: int,
@@ -149,7 +149,8 @@ class ViTLSNetEncoderLayer(nn.Module):
                  dropout: float = 0.0,
                  spatial_size: int = 14,  # 空间特征图尺寸
                  use_kimi_residual: bool = True,
-                 use_ls_conv: bool = True):
+                 use_ls_conv: bool = True,
+                 use_mhsa: bool = True):  # 新增：是否使用MHSA
         """
         Args:
             embed_dim: 嵌入维度
@@ -159,73 +160,81 @@ class ViTLSNetEncoderLayer(nn.Module):
             spatial_size: 空间特征图尺寸（用于LS卷积）
             use_kimi_residual: 是否使用Kimi自注意力残差连接
             use_ls_conv: 是否使用LS卷积
+            use_mhsa: 是否使用多头自注意力
         """
         super().__init__()
-        
+
         self.embed_dim = embed_dim
         self.spatial_size = spatial_size
         self.use_ls_conv = use_ls_conv
-        
+        self.use_mhsa = use_mhsa
+
         # 序列-空间转换
         self.seq2spatial = SequenceToSpatial()
         self.spatial2seq = SpatialToSequence()
-        
+
         # 1. LS卷积：局部特征聚合
         if use_ls_conv:
             from ls_conv import LSConv
             self.ls_conv = LSConv(embed_dim)
         else:
             self.ls_conv = nn.Identity()
-        
-        # 2. 多头自注意力 + Kimi残差连接
-        if use_kimi_residual:
-            self.attn_block = KimiAttentionBlock(
-                embed_dim, num_heads, mlp_ratio, dropout
-            )
+
+        # 2. 多头自注意力 + Kimi残差连接（可选）
+        if use_mhsa:
+            if use_kimi_residual:
+                self.attn_block = KimiAttentionBlock(
+                    embed_dim, num_heads, mlp_ratio, dropout
+                )
+            else:
+                self.attn_block = StandardAttentionBlock(
+                    embed_dim, num_heads, mlp_ratio, dropout
+                )
         else:
-            self.attn_block = StandardAttentionBlock(
-                embed_dim, num_heads, mlp_ratio, dropout
-            )
-        
+            # 不使用MHSA时，只使用FFN
+            self.attn_block = FFNBlock(embed_dim, mlp_ratio, dropout)
+
         # 3. 前馈网络（FFN）已经在attn_block中包含
-        # 如果需要单独的FFN，可以在这里添加
         
     def forward(self, x, return_attn=False):
         """
         Args:
             x: 输入序列 (B, N+1, C)
             return_attn: 是否返回注意力权重
-            
+
         Returns:
             output: 输出序列 (B, N+1, C)
             attn_weights: 注意力权重（可选）
             alpha: Kimi残差权重（可选）
         """
         identity = x
-        
+
         # 转换为空间维度进行LS卷积
         spatial_x = self.seq2spatial(x, self.spatial_size, self.spatial_size)
-        
+
         # 1. LS卷积：局部特征聚合
         # 提取面部五官细节特征（眼睛、嘴巴、眉毛）
         if self.use_ls_conv:
             spatial_x = self.ls_conv(spatial_x)
-        
+
         # 转换回序列维度
         x = self.spatial2seq(spatial_x, self.spatial_size, self.spatial_size)
-        
-        # 2. 多头自注意力：全局信息交互
-        # 建模面部整体表情的全局依赖关系
-        # 使用Kimi自注意力残差连接
-        if return_attn:
-            x, attn_weights, alpha = self.attn_block(x, return_attn=True)
+
+        # 2. 可选的多头自注意力：全局信息交互
+        # 如果use_mhsa=False，只执行FFN
+        if self.use_mhsa:
+            if return_attn:
+                x, attn_weights, alpha = self.attn_block(x, return_attn=True)
+            else:
+                x = self.attn_block(x)
+                attn_weights = None
+                alpha = None
         else:
+            # 只执行FFN（LS Block）
             x = self.attn_block(x)
             attn_weights = None
             alpha = None
-        
-        # 3. 前馈网络（FFN）已经在attn_block中
-        
+
         if return_attn:
             return x, attn_weights, alpha
         return x
@@ -233,11 +242,12 @@ class ViTLSNetEncoderLayer(nn.Module):
 
 class ViTLSNetEncoder(nn.Module):
     """
-    ViT-LSNet融合的Transformer Encoder
-    
-    由多个ViTLSNetEncoderLayer堆叠而成
+    ViT-LSNet融合的Transformer Encoder（分层架构版）
+
+    前几层：LS Block（LSConv + FFN，无MHSA）
+    后几层：MSA Block（MHSA + FFN）
     """
-    
+
     def __init__(self,
                  embed_dim: int = 384,
                  num_layers: int = 12,
@@ -246,7 +256,8 @@ class ViTLSNetEncoder(nn.Module):
                  dropout: float = 0.0,
                  spatial_size: int = 14,
                  use_kimi_residual: bool = True,
-                 use_ls_conv: bool = True):
+                 use_ls_conv: bool = True,
+                 ls_block_layers: int = 4):  # 前几层只用LSConv
         """
         Args:
             embed_dim: 嵌入维度
@@ -257,25 +268,42 @@ class ViTLSNetEncoder(nn.Module):
             spatial_size: 空间特征图尺寸
             use_kimi_residual: 是否使用Kimi残差连接
             use_ls_conv: 是否使用LS卷积
+            ls_block_layers: 前几层只用LSConv的层数
         """
         super().__init__()
-        
+
         self.embed_dim = embed_dim
         self.num_layers = num_layers
-        
-        # 构建多层Encoder
-        self.layers = nn.ModuleList([
-            ViTLSNetEncoderLayer(
-                embed_dim=embed_dim,
-                num_heads=num_heads,
-                mlp_ratio=mlp_ratio,
-                dropout=dropout,
-                spatial_size=spatial_size,
-                use_kimi_residual=use_kimi_residual,
-                use_ls_conv=use_ls_conv
-            )
-            for _ in range(num_layers)
-        ])
+        self.ls_block_layers = ls_block_layers
+
+        # 构建分层Encoder
+        self.layers = nn.ModuleList()
+        for i in range(num_layers):
+            # 前ls_block_layers层：LS Block（无MHSA）
+            # 后面层：MSA Block（有MHSA）
+            if i < ls_block_layers:
+                layer = ViTLSNetEncoderLayer(
+                    embed_dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    dropout=dropout,
+                    spatial_size=spatial_size,
+                    use_kimi_residual=False,  # LS Block不需要Kimi残差
+                    use_ls_conv=True,
+                    use_mhsa=False  # 关键：不使用MHSA
+                )
+            else:
+                layer = ViTLSNetEncoderLayer(
+                    embed_dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    dropout=dropout,
+                    spatial_size=spatial_size,
+                    use_kimi_residual=use_kimi_residual,
+                    use_ls_conv=use_ls_conv,
+                    use_mhsa=True  # 关键：使用MHSA
+                )
+            self.layers.append(layer)
         
     def forward(self, x, return_all_layers=False, return_attn=False):
         """
@@ -310,6 +338,42 @@ class ViTLSNetEncoder(nn.Module):
             return x, all_outputs
         elif return_attn:
             return x, all_attns, all_alphas
+        return x
+
+
+class FFNBlock(nn.Module):
+    """
+    前馈网络块（FFN）
+    用于LS Block中（无MHSA的情况）
+    """
+
+    def __init__(self, embed_dim, mlp_ratio=4.0, dropout=0.0):
+        super().__init__()
+
+        hidden_dim = int(embed_dim * mlp_ratio)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, embed_dim),
+            nn.Dropout(dropout)
+        )
+
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        """
+        Args:
+            x: 输入序列 (B, N+1, C)
+
+        Returns:
+            output: 输出序列 (B, N+1, C)
+        """
+        identity = x
+        x = self.norm(x)
+        x = self.mlp(x)
+        x = x + identity
         return x
 
 

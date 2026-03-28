@@ -43,7 +43,8 @@ class ViTLSNetFER(nn.Module):
                  spatial_size: int = 14,
                  use_kimi_residual: bool = True,
                  use_ls_conv: bool = True,
-                 use_mtcnn: bool = False):
+                 use_mtcnn: bool = False,
+                 ls_block_layers: int = 4):  # 新增参数
         """
         Args:
             img_size: 输入图像尺寸
@@ -59,17 +60,18 @@ class ViTLSNetFER(nn.Module):
             use_kimi_residual: 是否使用Kimi自注意力残差连接
             use_ls_conv: 是否使用LS卷积
             use_mtcnn: 是否使用MTCNN预处理（推理时启用）
+            ls_block_layers: 前几层只用LSConv的层数
         """
         super().__init__()
-        
+
         self.num_classes = num_classes
         self.embed_dim = embed_dim
         self.use_mtcnn = use_mtcnn
-        
+
         # MTCNN人脸检测器（推理时使用）
         if use_mtcnn:
             self.mtcnn = MTCNNDetector(target_size=(img_size, img_size))
-        
+
         # Patch Embedding
         self.patch_embed = PatchEmbedding(
             img_size=img_size,
@@ -77,8 +79,8 @@ class ViTLSNetFER(nn.Module):
             in_channels=in_channels,
             embed_dim=embed_dim
         )
-        
-        # ViT-LSNet Encoder
+
+        # ViT-LSNet Encoder（分层架构）
         self.encoder = ViTLSNetEncoder(
             embed_dim=embed_dim,
             num_layers=num_layers,
@@ -87,7 +89,8 @@ class ViTLSNetFER(nn.Module):
             dropout=dropout,
             spatial_size=spatial_size,
             use_kimi_residual=use_kimi_residual,
-            use_ls_conv=use_ls_conv
+            use_ls_conv=use_ls_conv,
+            ls_block_layers=ls_block_layers  # 新增参数
         )
         
         # 分类头
@@ -222,25 +225,46 @@ class ViTLSNetFER(nn.Module):
     def get_attention_maps(self, x, layer_idx=-1):
         """
         获取注意力图用于可视化
-        
+
         Args:
             x: 输入图像
-            layer_idx: 层索引（-1表示最后一层）
-            
+            layer_idx: 层索引（-1表示最后一层使用MHSA的层）
+
         Returns:
             attention_map: 注意力图 (B, num_heads, N, N)
         """
         self.eval()
         with torch.no_grad():
-            _, all_attns, _ = self.forward(x, return_attn=True)
-            attention_map = all_attns[layer_idx]
-        return attention_map
+            # Patch Embedding
+            x = self.patch_embed(x)
+
+            # 获取所有层的注意力权重
+            attn_maps = []
+            for i, layer in enumerate(self.encoder.layers):
+                # 通过前向传播获取注意力权重
+                x, attn_weights, alpha = layer(x, return_attn=True)
+
+                # 只收集有MHSA的层的注意力权重
+                if attn_weights is not None:
+                    attn_maps.append(attn_weights)
+
+                    # 如果是目标层，返回注意力权重
+                    if layer_idx == -1 and i == len(self.encoder.layers) - 1:
+                        return attn_weights
+                    elif i == layer_idx:
+                        return attn_weights
+
+            # 如果没有找到目标层，返回最后一个有MHSA的层
+            if attn_maps:
+                return attn_maps[-1]
+            else:
+                return None
 
 
 class ViTLSNetFERConfig:
     """模型配置类"""
-    
-    # 轻量级配置（适合RTX4060）
+
+    # 轻量级配置（分层架构，优化参数量）
     LIGHT = {
         'img_size': 224,
         'patch_size': 16,
@@ -253,9 +277,10 @@ class ViTLSNetFERConfig:
         'spatial_size': 14,
         'use_kimi_residual': True,
         'use_ls_conv': True,
+        'ls_block_layers': 8,  # 前8层只用LSConv（66.7%），后4层用MHSA（33.3%）
     }
-    
-    # 超轻量级配置
+
+    # 超轻量级配置（分层架构）
     TINY = {
         'img_size': 224,
         'patch_size': 16,
@@ -268,8 +293,25 @@ class ViTLSNetFERConfig:
         'spatial_size': 14,
         'use_kimi_residual': True,
         'use_ls_conv': True,
+        'ls_block_layers': 6,  # 前6层只用LSConv（75%），后2层用MHSA（25%）
     }
-    
+
+    # 微型配置（极低参数量）
+    MINI = {
+        'img_size': 224,
+        'patch_size': 16,
+        'num_classes': 7,
+        'embed_dim': 128,
+        'num_layers': 6,
+        'num_heads': 4,
+        'mlp_ratio': 3.0,
+        'dropout': 0.1,
+        'spatial_size': 14,
+        'use_kimi_residual': True,
+        'use_ls_conv': True,
+        'ls_block_layers': 5,  # 前5层只用LSConv（83%），后1层用MHSA（17%）
+    }
+
     # 标准配置
     BASE = {
         'img_size': 224,

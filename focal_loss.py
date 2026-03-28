@@ -47,12 +47,15 @@ class FocalLoss(nn.Module):
         # 计算focal weight
         focal_weight = (1 - p_t) ** self.gamma
 
-        # 应用类别权重
+        # 应用类别权重（修复设备问题）
         if self.alpha is not None:
             if isinstance(self.alpha, (float, int)):
                 alpha_t = self.alpha
             else:
-                alpha_t = self.alpha[targets]
+                # 确保alpha在正确的设备上
+                alpha = self.alpha.to(inputs.device) if self.alpha.device != inputs.device else self.alpha
+                alpha_t = alpha[targets]
+
             focal_weight = alpha_t * focal_weight
 
         # 计算focal loss
@@ -78,52 +81,16 @@ class WeightedFocalLoss(nn.Module):
 
     def __init__(self, class_weights=None, gamma=2.0):
         super(WeightedFocalLoss, self).__init__()
-        self.class_weights = class_weights
+
+        if class_weights is not None:
+            # 转换为tensor并设置设备（将在forward中使用）
+            self.register_buffer('alpha', class_weights.float())
+        else:
+            self.alpha = None
+
         self.gamma = gamma
 
     def forward(self, inputs, targets):
-        # 计算softmax概率
-        p = F.softmax(inputs, dim=1)
-
-        # 获取真实类别的概率
-        p_t = p.gather(1, targets.unsqueeze(1)).squeeze(1)
-
-        # 计算交叉熵
-        ce_loss = F.cross_entropy(inputs, targets, weight=self.class_weights, reduction='none')
-
-        # 计算focal weight
-        focal_weight = (1 - p_t) ** self.gamma
-
-        # 计算focal loss
-        focal_loss = focal_weight * ce_loss
-
-        return focal_loss.mean()
-
-
-# 测试代码
-if __name__ == "__main__":
-    print("测试Focal Loss...")
-
-    # 模拟输出和标签
-    batch_size = 4
-    num_classes = 7
-    inputs = torch.randn(batch_size, num_classes)
-    targets = torch.tensor([0, 1, 2, 3])
-
-    # 标准交叉熵损失
-    ce_loss = nn.CrossEntropyLoss()
-    ce_value = ce_loss(inputs, targets)
-    print(f"CrossEntropy Loss: {ce_value.item():.4f}")
-
-    # Focal Loss (gamma=2.0)
-    focal_loss = FocalLoss(gamma=2.0)
-    focal_value = focal_loss(inputs, targets)
-    print(f"Focal Loss (gamma=2.0): {focal_value.item():.4f}")
-
-    # 带类别权重的Focal Loss
-    class_weights = torch.tensor([1.07, 9.22, 1.00, 0.58, 0.82, 1.23, 0.83])
-    weighted_focal_loss = FocalLoss(alpha=class_weights, gamma=2.0)
-    weighted_value = weighted_focal_loss(inputs, targets)
-    print(f"Weighted Focal Loss: {weighted_value.item():.4f}")
-
-    print("\nFocal Loss测试通过!")
+        # 使用FocalLoss
+        focal_loss_fn = FocalLoss(alpha=self.alpha, gamma=self.gamma)
+        return focal_loss_fn(inputs, targets)

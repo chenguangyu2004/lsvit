@@ -12,7 +12,7 @@ from typing import Optional
 
 class DepthWiseConv(nn.Module):
     """深度可分离卷积"""
-    
+
     def __init__(self, in_channels, kernel_size, stride=1, padding=0, dilation=1):
         super().__init__()
         self.depthwise = nn.Conv2d(
@@ -23,7 +23,7 @@ class DepthWiseConv(nn.Module):
         self.pointwise = nn.Conv2d(
             in_channels, in_channels, 1, bias=False
         )
-        
+
     def forward(self, x):
         x = self.depthwise(x)
         x = self.pointwise(x)
@@ -32,135 +32,128 @@ class DepthWiseConv(nn.Module):
 
 class DynamicConv2d(nn.Module):
     """
-    动态卷积：根据输入特征动态调整卷积核
-    实现Focus Small思想
+    分组动态卷积（轻量化版）
+    替代4个独立卷积核，使用分组卷积大幅降低参数量
     """
-    
-    def __init__(self, 
+
+    def __init__(self,
                  in_channels: int,
                  out_channels: int,
                  kernel_size: int = 3,
-                 num_kernels: int = 4):
+                 num_groups: int = 16):
         """
         Args:
             in_channels: 输入通道数
             out_channels: 输出通道数
             kernel_size: 卷积核大小
-            num_kernels: 动态卷积核数量
+            num_groups: 分组数（G=16时参数量约为原来的1/4）
         """
         super().__init__()
-        self.num_kernels = num_kernels
-        
-        # 创建多个卷积核
-        self.convs = nn.ModuleList([
-            nn.Conv2d(in_channels, out_channels, kernel_size, padding=kernel_size//2)
-            for _ in range(num_kernels)
-        ])
-        
-        # 注意力网络，用于选择卷积核
-        self.attention = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_channels, in_channels // 4, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels // 4, num_kernels, 1),
-            nn.Softmax(dim=1)
+        self.num_groups = num_groups
+
+        # 使用分组卷积替代多个独立卷积
+        self.dynamic_conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size,
+            padding=kernel_size // 2,
+            groups=num_groups,  # 关键：使用分组卷积
+            bias=False
         )
-        
+
+        # 轻量级注意力：直接生成分组权重（LKP）
+        # 不使用独立的注意力网络
+        self.lkp = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, num_groups, 1),
+            nn.Sigmoid()
+        )
+
     def forward(self, x):
-        # 生成动态权重
-        attention_weights = self.attention(x)  # (B, num_kernels, 1, 1)
-        
-        # 计算所有卷积核的输出
-        conv_outputs = [conv(x) for conv in self.convs]
-        stacked = torch.stack(conv_outputs, dim=1)  # (B, num_kernels, C, H, W)
-        
-        # 应用注意力权重
-        attention_weights = attention_weights.unsqueeze(-1)  # (B, num_kernels, 1, 1, 1)
-        output = (stacked * attention_weights).sum(dim=1)  # (B, C, H, W)
-        
-        return output
+        # LKP直接生成分组权重
+        group_weights = self.lkp(x)  # (B, num_groups, 1, 1)
+
+        # 分组卷积
+        x = self.dynamic_conv(x)
+
+        # 应用分组权重
+        # 将通道按group维度切分并应用权重
+        B, C, H, W = x.shape
+        x = x.view(B, self.num_groups, -1, H, W)  # (B, G, C//G, H, W)
+        group_weights = group_weights.unsqueeze(2)  # (B, G, 1, 1, 1)
+        x = x * group_weights
+        x = x.view(B, C, H, W)  # 还原形状
+
+        return x
 
 
 class LSConv(nn.Module):
     """
-    LS卷积模块：See Large + Focus Small
-    
+    LS卷积模块：See Large + Focus Small（轻量化版）
+
     结构:
-    1. 大核深度卷积（See Large）：捕获全局上下文
-    2. 小核动态卷积（Focus Small）：聚焦局部细节（眼睛/嘴巴/眉毛）
+    1. 大核深度卷积（See Large）：捕获全局上下文（7×7）
+    2. 小核动态卷积（Focus Small）：聚焦局部细节（3×3，G=16）
     3. 特征融合
     """
-    
-    def __init__(self, 
+
+    def __init__(self,
                  channels: int,
-                 large_kernel: int = 21,
+                 large_kernel: int = 7,  # 从21改为7
                  small_kernel: int = 3,
-                 reduction: int = 4):
+                 num_groups: int = 16):  # 使用分组卷积
         """
         Args:
             channels: 通道数
-            large_kernel: 大核尺寸（用于全局感知）
-            small_kernel: 小核尺寸（用于局部聚焦）
-            reduction: 特征压缩比例
+            large_kernel: 大核尺寸（从21改为7）
+            small_kernel: 小核尺寸（3）
+            num_groups: 动态卷积的分组数（G=16）
         """
         super().__init__()
-        
+
         # See Large: 大核深度卷积捕获全局结构
+        # 从21×21改为7×7，参数量减少约9倍
         self.see_large = DepthWiseConv(
-            channels, large_kernel, 
+            channels, large_kernel,
             padding=large_kernel // 2
         )
-        
-        # Focus Small: 小核动态卷积聚焦局部细节
+
+        # Focus Small: 小核分组动态卷积聚焦局部细节
+        # 使用分组卷积（G=16），参数量约为原来的1/4
         self.focus_small = DynamicConv2d(
-            channels, channels, 
-            small_kernel, 
-            num_kernels=4
+            channels, channels,
+            small_kernel,
+            num_groups=num_groups
         )
-        
-        # 特征融合
+
+        # 特征融合（轻量化）
         self.fusion = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, 1),
+            nn.Conv2d(channels * 2, channels, 1),  # 1×1卷积
             nn.BatchNorm2d(channels),
             nn.ReLU(inplace=True)
         )
-        
-        # 通道注意力
-        self.channel_attention = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, channels // reduction, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // reduction, channels, 1),
-            nn.Sigmoid()
-        )
-        
+
     def forward(self, x):
         """
         Args:
             x: 输入特征 (B, C, H, W)
-            
+
         Returns:
             输出特征 (B, C, H, W)
         """
         identity = x
-        
+
         # See Large: 全局感知
         large_feat = self.see_large(x)
-        
+
         # Focus Small: 局部聚焦
         small_feat = self.focus_small(x)
-        
+
         # 特征融合
         fused = torch.cat([large_feat, small_feat], dim=1)
         fused = self.fusion(fused)
-        
-        # 通道注意力重标定
-        ca = self.channel_attention(fused)
-        fused = fused * ca
-        
+
         # 残差连接
         output = fused + identity
-        
+
         return output
 
 
